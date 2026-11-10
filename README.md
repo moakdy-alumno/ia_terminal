@@ -93,19 +93,33 @@ ia
    ```bash
    ia "Explícame qué elementos tengo en ~/Descargas"
    ```
-3. **Gestión de Paginación:**
-   Si pides una explicación extensa como *"Escribe un tutorial largo del Kernel de Linux"*, aparecerá el paginador interactivo:
-   `-- Más -- (Presiona ENTER para continuar, 'q' para salir)`
 
 ---
 
-## ⚙️ Estructura del Código
+## 🔍 Añadido el 10/11/26
 
-- `ia_terminal.py`: Script principal de ejecución.
-- `CONTEXTO_SISTEMA`: Rol preconfigurado que moldea el comportamiento de la IA para administración y desarrollo.
-- `inspeccionar_ruta_sistema()`: Módulo de telemetría que extrae las propiedades de hardware y bloques de código antes de enviarlos a la API.
-- `imprimir_con_paginador()`: Control del renderizado en bloques según el alto de `os.get_terminal_size()`.
+-Extraccion de pdf para su comprensión por IA.
+-Lee pdf escaneados OCR.
+-Edicion de linea en la terminal. Ahora podras:
+- ← / →: moverte por el texto para insertar o borrar.
+- Inicio / Fin: ir al principio o al final.
+- ↑ / ↓: recuperar lo que escribiste anteriormente.
+- Ctrl + U: borrar desde el cursor hasta el principio.
+- Enter: enviar el mensaje.
+Esto permite editar antes de pulsar Enter.
+-Guarda conversaciones en base de datos sqlite.
+⌨️ Comandos internos del modo interactivo
+Se incorpora un sistema de comandos para gestionar el asistente desde el chat:
+Comando	        Función
+/ayuda	        Muestra los comandos disponibles.
+/limpiar	    Borra el historial de la sesión y los mensajes guardados en SQLite, previa confirmación.
+/adjuntar ruta	Lee y analiza un archivo utilizando la extracción de texto y el OCR disponibles.
+/salir	        Cierra el programa.
 
----
 
-## 🔍 Añadida la extración y envio de documentos pdf.10/11/26 (a traves de "pypdf")
+Las rutas de archivos admiten espacios y pueden escribirse entre comillas:
+/adjuntar "/home/usuario/Descargas/Mi curriculum.pdf"
+
+Después de analizar el archivo, se pueden hacer preguntas sobre su contenido dentro de la conversación.
+
+

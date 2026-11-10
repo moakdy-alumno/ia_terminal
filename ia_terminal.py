@@ -5,6 +5,16 @@ import mimetypes
 import textwrap
 import re
 import shlex
+import sqlite3
+import tempfile
+import shutil
+from contextlib import closing
+
+# Activa la edición con flechas en las terminales de Linux.
+try:
+    import readline
+except ImportError:
+    pass
 from datetime import datetime
 from openai import OpenAI
 
@@ -18,6 +28,7 @@ MODELO = "gpt-4o-mini"
 MAX_HISTORIAL = 20
 MAX_TEXTO_ARCHIVO = 40000  # Limita el texto enviado a la IA.
 MAX_PAGINAS_PDF = 50
+RUTA_DB = os.path.join(os.path.dirname(os.path.abspath(__file__)), "conversaciones.db")
 
 # Instala el lector de PDF con: python3 -m pip install pypdf
 try:
@@ -122,6 +133,28 @@ def imprimir_con_paginador(lineas, prefijo=""):
                     break
                 contador = 0
 
+def extraer_texto_ocr(ruta, numero_pagina):
+    """Reconoce español e inglés localmente en una página escaneada."""
+    if not shutil.which("pdftoppm") or not shutil.which("tesseract"):
+        raise RuntimeError(
+            "Para usar OCR instala: sudo apt install poppler-utils "
+            "tesseract-ocr tesseract-ocr-spa tesseract-ocr-eng"
+        )
+    with tempfile.TemporaryDirectory() as carpeta:
+        prefijo = os.path.join(carpeta, "pagina")
+        subprocess.run(
+            ["pdftoppm", "-f", str(numero_pagina), "-l", str(numero_pagina),
+             "-scale-to", "2000", "-singlefile", "-png",
+             os.path.abspath(ruta), prefijo],
+            check=True, capture_output=True, timeout=90,
+        )
+        resultado = subprocess.run(
+            ["tesseract", prefijo + ".png", "stdout", "-l", "spa+eng"],
+            check=True, capture_output=True, text=True, encoding="utf-8", timeout=90,
+        )
+        return resultado.stdout.strip()
+
+
 def leer_pdf(ruta):
     """Extrae texto localmente; solo ese texto se envía a la IA, no el PDF."""
     if PdfReader is None:
@@ -134,8 +167,18 @@ def leer_pdf(ruta):
         caracteres = 0
         hay_texto = False
         truncado = False
+        uso_ocr = False
         for numero, pagina in enumerate(lector.pages[:MAX_PAGINAS_PDF], 1):
             texto = pagina.extract_text() or ""
+            if not texto.strip():
+                print(f"🔍 Aplicando OCR a la página {numero}...")
+                uso_ocr = True
+                try:
+                    texto = extraer_texto_ocr(ruta, numero)
+                except Exception as error:
+                    # Conserva el texto de otras páginas aunque falle el OCR.
+                    fragmentos.append(f"\n[OCR no disponible en página {numero}: {error}]\n")
+                    continue
             hay_texto = hay_texto or bool(texto.strip())
             bloque = f"\n[Página {numero}]\n{texto}"
             restante = MAX_TEXTO_ARCHIVO - caracteres
@@ -145,10 +188,11 @@ def leer_pdf(ruta):
                 truncado = True
                 break
         if not hay_texto:
-            fragmentos.append("\n[No se encontró texto en las páginas examinadas. Si es un PDF escaneado, necesita OCR.]")
+            fragmentos.append("\n[No se encontró texto legible en las páginas examinadas; revisa los avisos de OCR.]")
         if truncado or len(lector.pages) > MAX_PAGINAS_PDF:
-            fragmentos.append("\n[Lectura parcial: límite de 50 páginas o 40000 caracteres.]")
-        fragmentos.append("\n[Las páginas escaneadas pueden no aportar texto; no se aplica OCR.]")
+            fragmentos.append(f"\n[Lectura parcial: límite de {MAX_PAGINAS_PDF} páginas o {MAX_TEXTO_ARCHIVO} caracteres.]")
+        if uso_ocr:
+            fragmentos.append("\n[Se ha intentado aplicar OCR; el reconocimiento puede contener errores.]")
         return "".join(fragmentos)
     except Exception as error:
         return f"[No se pudo leer el PDF: {error}]"
@@ -240,58 +284,154 @@ def extraer_comando(texto):
     match = BASH_REGEX.search(texto)
     return match.group(1).strip() if match else None
 
+def abrir_db():
+    """Prepara la tabla; cada mensaje conserva su rol y su fecha en UTC."""
+    conexion = sqlite3.connect(RUTA_DB)
+    conexion.execute("""
+        CREATE TABLE IF NOT EXISTS mensajes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            rol TEXT NOT NULL,
+            contenido TEXT NOT NULL,
+            fecha TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conexion.commit()
+    return conexion
+
+
+def guardar_mensaje(rol, contenido):
+    with closing(abrir_db()) as conexion, conexion:
+        conexion.execute(
+            "INSERT INTO mensajes (rol, contenido) VALUES (?, ?)", (rol, contenido)
+        )
+
+
+def cargar_historial():
+    with closing(abrir_db()) as conexion:
+        filas = conexion.execute(
+            "SELECT rol, contenido FROM mensajes ORDER BY id DESC LIMIT ?",
+            (MAX_HISTORIAL,),
+        ).fetchall()
+    return [{"role": rol, "content": contenido} for rol, contenido in reversed(filas)]
+
+
+def responder_en_directo(mensajes):
+    """Muestra los fragmentos y devuelve la respuesta para guardar o analizar."""
+    fragmentos = []
+    flujo = client.chat.completions.create(
+        model=MODELO, messages=mensajes, stream=True,
+    )
+    print("\nIA ➜ ", end="", flush=True)
+    try:
+        for parte in flujo:
+            if not parte.choices:
+                continue
+            texto = parte.choices[0].delta.content or ""
+            if texto:
+                print(texto, end="", flush=True)
+                fragmentos.append(texto)
+    finally:
+        flujo.close()
+        print()
+    return "".join(fragmentos)
+
+
 def preguntar_ia(prompt):
     try:
         prompt_enriquecido = escanear_pregunta_usuario(prompt)
-        respuesta = client.chat.completions.create(
-            model=MODELO,
-            messages=[CONTEXTO_SISTEMA, {"role": "user", "content": prompt_enriquecido}]
+        texto_ia = responder_en_directo(
+            [CONTEXTO_SISTEMA, {"role": "user", "content": prompt_enriquecido}]
         )
-        texto_ia = respuesta.choices[0].message.content
-        
-        # Procesamos y paginamos el resultado
-        lineas_ajustadas = formatear_y_ajustar_texto(texto_ia)
-        imprimir_con_paginador(lineas_ajustadas)
-        
         comando = extraer_comando(texto_ia)
         if comando:
             ejecutar_comando_sistema(comando)
-    except Exception as e:
-        print(f"❌ Error: {e}")
+    except (KeyboardInterrupt, EOFError):
+        print("\nConsulta interrumpida.")
+    except Exception as error:
+        print(f"❌ Error: {error}")
+
 
 def modo_chat():
-    print("=== IA de Terminal (Escribe 'salir') ===")
-    historial = [CONTEXTO_SISTEMA]
-    
+    print("=== IA de Terminal (Escribe /ayuda para ver los comandos) ===")
+    try:
+        historial = [CONTEXTO_SISTEMA] + cargar_historial()
+    except sqlite3.Error as error:
+        print(f"❌ No se pudo abrir el historial: {error}")
+        return
+
     while True:
         try:
-            user_input = input("\nTú ➜ ")
-            if user_input.lower() in {'salir', 'exit', 'quit'}:
-                break
-            if not user_input.strip():
+            user_input = input("\nTú ➜ ").strip()
+            if not user_input:
                 continue
-                
-            prompt_enriquecido = escanear_pregunta_usuario(user_input)
+            partes = user_input.split(maxsplit=1)
+            comando = partes[0].lower()
+            argumento = partes[1] if len(partes) > 1 else ""
+
+            if comando in {"/salir", "salir", "exit", "quit"}:
+                break
+            if comando == "/ayuda":
+                print(
+                    "\n/ayuda           Mostrar los comandos.\n"
+                    "/limpiar         Borrar toda la conversación guardada.\n"
+                    "/adjuntar ruta   Leer y analizar un archivo.\n"
+                    "/salir           Cerrar el programa."
+                )
+                continue
+            if comando == "/limpiar":
+                confirmar = input("¿Borrar toda la conversación guardada? (s/n): ")
+                if confirmar.strip().lower() == "s":
+                    with closing(abrir_db()) as conexion, conexion:
+                        conexion.execute("DELETE FROM mensajes")
+                    historial = [CONTEXTO_SISTEMA]
+                    print("🧹 Conversación borrada. Empezamos de nuevo.")
+                continue
+            if comando == "/adjuntar":
+                if not argumento:
+                    print('Uso: /adjuntar "/ruta/al/documento.pdf"')
+                    continue
+                ruta = os.path.expanduser(argumento)
+                if not os.path.isfile(ruta):
+                    # Acepta también comillas y espacios escapados al arrastrar.
+                    try:
+                        rutas = shlex.split(argumento)
+                    except ValueError:
+                        rutas = []
+                    ruta = os.path.expanduser(rutas[0]) if len(rutas) == 1 else ""
+                if not os.path.isfile(ruta):
+                    print("❌ No se encuentra el archivo.")
+                    continue
+                # Lee la ruta exacta, aunque incluya espacios o signos.
+                reporte = inspeccionar_ruta_sistema(ruta)
+                prompt_enriquecido = (
+                    "Analiza el contenido de este archivo y resume "
+                    f"la información principal: {ruta}\n\n{reporte}"
+                )
+            elif comando.startswith("/") and not os.path.exists(user_input):
+                print("Comando desconocido. Escribe /ayuda.")
+                continue
+            else:
+                prompt_enriquecido = escanear_pregunta_usuario(user_input)
+
+            guardar_mensaje("user", prompt_enriquecido)
             historial.append({"role": "user", "content": prompt_enriquecido})
-            
-            if len(historial) > MAX_HISTORIAL:
-                historial = [CONTEXTO_SISTEMA] + historial[-MAX_HISTORIAL:]
-            
-            respuesta = client.chat.completions.create(model=MODELO, messages=historial)
-            texto_ia = respuesta.choices[0].message.content
-            
-            # Procesamos e imprimimos usando el nuevo paginador integrado
-            print() # Salto de línea estético
-            lineas_ajustadas = formatear_y_ajustar_texto(texto_ia)
-            imprimir_con_paginador(lineas_ajustadas, prefijo="IA ➜")
-            
+            historial = [CONTEXTO_SISTEMA] + historial[1:][-MAX_HISTORIAL:]
+
+            # En directo: la terminal ajusta las líneas y no pausa con el paginador.
+            texto_ia = responder_en_directo(historial)
+            guardar_mensaje("assistant", texto_ia)
             historial.append({"role": "assistant", "content": texto_ia})
-            
+
             comando = extraer_comando(texto_ia)
             if comando:
                 ejecutar_comando_sistema(comando)
         except (KeyboardInterrupt, EOFError):
+            print("\nChat cerrado.")
             break
+        except Exception as error:
+            # Una consulta fallida no cierra toda la sesión.
+            print(f"❌ Error: {error}")
+
 
 if __name__ == "__main__":
     if len(sys.argv) > 1:
