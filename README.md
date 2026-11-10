@@ -30,8 +30,8 @@ cd ~/preguntar-ia
 python3 -m venv venv
 source venv/bin/activate
 
-# Instalar la SDK de OpenAI
-pip install openai
+# Instalar librerias
+pip install -r requeriments.txt
 ```
 
 ### 2. Configuración de Credenciales
@@ -105,3 +105,7 @@ ia
 - `CONTEXTO_SISTEMA`: Rol preconfigurado que moldea el comportamiento de la IA para administración y desarrollo.
 - `inspeccionar_ruta_sistema()`: Módulo de telemetría que extrae las propiedades de hardware y bloques de código antes de enviarlos a la API.
 - `imprimir_con_paginador()`: Control del renderizado en bloques según el alto de `os.get_terminal_size()`.
+
+---
+
+## 🔍 Añadida la extración y envio de documentos pdf.10/11/26 (a traves de "pypdf")
